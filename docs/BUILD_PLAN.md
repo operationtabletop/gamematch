@@ -1,255 +1,285 @@
 # GameMatch — Complete Build Plan & Directions
 
 > Self-contained directions for building the Operation Tabletop Game Night Group
-> Matcher. Written so a future session (or developer) can build it end-to-end
-> without re-deriving the requirements. Read this top-to-bottom before coding.
+> Matcher as a **standalone web application** (no Monday.com). Written so a future
+> session or developer can build it end-to-end. Read top-to-bottom before coding.
 
 ---
 
 ## 1. The goal
 
-Operation Tabletop runs game nights at military community locations (Hurlburt
-Field, Eglin). Participants register through a **Monday.com form**. Staff
-currently match players into groups by game preference **manually over email**.
+Operation Tabletop runs game nights (locations include Hurlburt Field and Eglin).
+Players want to find groups to play specific games. Today staff match players by
+hand over email. GameMatch is a self-contained web app that:
 
-GameMatch automates the matching and notification:
+- Lets **players register** for an event and pick the game they want a group for.
+- **Groups** everyone who wants the same game at that event (no size cap — connect
+  *everyone* interested in a game).
+- Notifies matched players **in the app and by email**.
+- Gives **staff** a passcode-protected admin to create events, run matching, and
+  send emails.
 
-- Read registrations **live from Monday.com** for a chosen event date/location.
-- Keep everyone who said **Yes** to *"Are you interested in finding a group?"*.
-- **Group them by the game** they want to play (no group-size limit — connect
-  *everyone* interested in a given game).
-- Let staff **email each group** so players can connect.
+### Scope decisions (confirmed)
 
-Non-goals for v1: changing the registration flow, player-facing login, payments,
-scheduling, chat. Monday.com remains the system of record.
+| Decision | Choice |
+|----------|--------|
+| Player identity | **Accounts with login** (email/password or Google) |
+| Match delivery | **Email + in-app** (players see their group in the app) |
+| Admin access | **Single shared staff passcode** for v1 |
+| Data source | **The app's own database** (Monday.com removed entirely) |
+
+Non-goals for v1: payments, chat, mobile native apps, per-user staff roles
+(single shared admin passcode is enough to start).
 
 ---
 
 ## 2. Recommended tech stack
 
-**Build it as a single Next.js app deployed on Vercel.** One repo, one deploy,
-secure server-side secrets, no infrastructure to babysit.
+**One Next.js app, one Postgres database, deployed on Vercel.**
 
 | Concern | Recommendation | Notes / alternatives |
 |--------|----------------|----------------------|
-| Framework | **Next.js (App Router) + TypeScript** | UI pages + server-side API routes in one project. Server routes keep the Monday.com token and Resend key off the client. |
-| Styling/UI | **Tailwind CSS + shadcn/ui** | Fast, clean, accessible components (buttons, cards, date picker, toasts). |
-| Data | **Monday.com GraphQL API v2** | https://developer.monday.com/api-reference. No separate database needed for v1. |
-| Email | **Resend** (`resend` npm pkg) | 3,000 emails/mo free, simple API, good deliverability. Alternatives: SendGrid, Mailgun, AWS SES. |
-| Hosting | **Vercel** | Connect this GitHub repo → auto-deploy on push. Free "Hobby" tier is enough for an internal tool. |
-| Access control | **Single shared passcode** via Next.js middleware (env var) | Staff-only. Upgrade path: Auth.js with Google sign-in restricted to `@operationtabletop.org`. |
-| State / DB | **None for v1** | Monday.com is the source of truth. *Optional:* track "already emailed" by writing back to a Monday.com column instead of adding a DB. |
+| Framework | **Next.js (App Router) + TypeScript** | UI pages + server API/Server Actions in one project; secrets stay server-side. |
+| Styling/UI | **Tailwind CSS + shadcn/ui** | Buttons, cards, dialogs, date picker, toasts — fast and accessible. |
+| Database | **PostgreSQL** | Use **Neon** (serverless, generous free tier) or **Vercel Postgres**. |
+| ORM | **Prisma** | Type-safe models, easy migrations. (Alt: Drizzle.) |
+| Player auth | **Clerk** | Email/password **and** Google, plus email verification & password reset with almost no code. Free tier covers thousands of users. (Free alt: **Auth.js / NextAuth v5** — more wiring for credentials + verification.) |
+| Admin auth | **Shared passcode** via middleware on `/admin/*` | Staff-only. Upgrade path: give staff Clerk accounts with an `admin` role and drop the passcode. |
+| Email | **Resend** (`resend` pkg) | 3,000 emails/mo free, simple API. (Alts: SendGrid, Mailgun, SES.) |
+| Hosting | **Vercel** | Connect this GitHub repo → auto-deploy on push. Free Hobby tier is enough. |
 
-**Why not just keep it as a Claude artifact?** The artifact works for ad-hoc use
-inside a Claude chat, but a deployed app gives you: a stable URL staff can
-bookmark, secrets handled securely server-side, reliable scheduled email sending,
-and no dependency on opening a Claude conversation each time.
+**Consolidated alternative:** **Supabase** gives Postgres + Auth + storage from one
+vendor. Fewer accounts to manage, but Clerk's player auth UX is more turnkey. The
+plan below assumes **Clerk + Postgres + Prisma**; swapping to Supabase changes only
+the auth/DB wiring, not the data model or features.
 
-**Why no database?** The only "state" is the registration data (lives in
-Monday.com) and optionally "who has been emailed" (can be a checkbox column
-written back to Monday.com). Adding Postgres/etc. would be overkill for v1.
+**Why a real app (vs. the earlier Monday.com artifact):** a standalone app gives
+you player accounts, in-app group viewing, your own data you control, a stable URL,
+and reliable scheduled email — none of which depend on a third-party board.
 
 ---
 
 ## 3. Architecture
 
 ```
-Browser (staff)                Next.js on Vercel                 External
-─────────────────             ───────────────────               ──────────
-[ /  matcher UI ] ── fetch ──► [ /api/registrations ] ─ GraphQL ► Monday.com API
-   pick date/loc                  (server, holds token)
-   see groups
-   click "Email" ─── POST ────► [ /api/send-emails ]  ─ REST ───► Resend API
-                                   (server, holds key)
-[ middleware: passcode gate on all routes ]
+                         Next.js on Vercel
+Browser (player) ──┐    ┌───────────────────────────┐        External
+  sign in (Clerk)  ├──► │ Player pages:             │
+  browse events    │    │  /, /events, /events/[id],│
+  register         │    │  /me (my groups)          │
+  see my group     │    │                           │
+                   │    │ Server Actions / API:     │ ── SQL ──► PostgreSQL
+Browser (staff) ───┤    │  register, run-match,     │            (Prisma)
+  /admin (passcode)│    │  send-emails              │
+  create events    │    │                           │ ── REST ─► Resend (email)
+  run match / email└──► │ middleware: Clerk auth +  │
+                        │ passcode gate on /admin   │ ◄─ auth ── Clerk
+                        └───────────────────────────┘
 ```
 
-- **Client** never sees the Monday.com token or Resend key — both live only in
-  server-side API routes as environment variables.
-- **Matching logic** runs server-side (or client-side over already-fetched data;
-  either is fine since it's simple grouping). Keep it in a shared `lib/` module.
+- **Players** authenticate via Clerk. **Admin** routes additionally require the
+  shared passcode (cookie set after entering it).
+- DB access and email sending happen only server-side (Server Actions or route
+  handlers). Secrets never reach the client.
+- Matching is a pure server-side function over registrations for an event.
 
 ---
 
-## 4. Monday.com data model (known column IDs)
+## 4. Data model (Prisma schema sketch)
 
-From inspecting the live registration board, these are the relevant columns.
-**Confirm the board ID and re-verify these IDs before building** (IDs are stable
-but the board may evolve).
+```prisma
+model User {            // mirror of the Clerk user we care about
+  id            String   @id              // Clerk user id
+  email         String   @unique
+  fullName      String?
+  createdAt     DateTime @default(now())
+  registrations Registration[]
+}
 
-| Field | Column ID | Type | Use |
-|-------|-----------|------|-----|
-| Full name | `name` | item name | Display in groups & email greeting |
-| Email | `emailrryi8rcj` | email | Recipient address |
-| Interested in finding a group? | `single_selectzk6zhjb` | status/single-select | **Filter: keep only "Yes"** |
-| Game wanted | `short_text1j90x04o` | short text | **Group key** |
-| Event date | `dates7uh919k` | date | Filter to the chosen event |
-| Location | *(TBD — confirm column ID)* | status/text | Optional filter: Hurlburt Field / Eglin |
+model Event {
+  id            String   @id @default(cuid())
+  title         String
+  date          DateTime
+  location      String?                    // e.g. "Hurlburt Field", "Eglin"
+  status        EventStatus @default(UPCOMING)
+  createdAt     DateTime @default(now())
+  registrations Registration[]
+  groups        Group[]
+}
 
-> ⚠️ **Action item:** confirm the **board ID** and the **location column ID** via
-> the Monday.com API (`boards { columns { id title type } }`) before coding. The
-> column IDs above came from a prior inspection and should be re-verified.
+enum EventStatus { UPCOMING MATCHED CLOSED }
 
-### Example GraphQL query
+model Registration {
+  id           String   @id @default(cuid())
+  user         User     @relation(fields: [userId], references: [id])
+  userId       String
+  event        Event    @relation(fields: [eventId], references: [id])
+  eventId      String
+  game         String                       // the game they want a group for
+  lookingForGroup Boolean @default(true)
+  groupMember  GroupMember?
+  createdAt    DateTime @default(now())
 
-```graphql
-query ($boardId: ID!) {
-  boards(ids: [$boardId]) {
-    items_page(limit: 500) {
-      cursor
-      items {
-        id
-        name
-        column_values {
-          id
-          text
-          value
-        }
-      }
-    }
-  }
+  @@unique([userId, eventId, game])         // one reg per game per event
+  @@index([eventId])
+}
+
+model Group {
+  id        String   @id @default(cuid())
+  event     Event    @relation(fields: [eventId], references: [id])
+  eventId   String
+  game      String
+  emailedAt DateTime?                        // null until notified
+  members   GroupMember[]
+  createdAt DateTime @default(now())
+  @@index([eventId])
+}
+
+model GroupMember {
+  id             String       @id @default(cuid())
+  group          Group        @relation(fields: [groupId], references: [id])
+  groupId        String
+  registration   Registration @relation(fields: [registrationId], references: [id])
+  registrationId String       @unique
 }
 ```
 
-Paginate with `cursor` if a board exceeds the page limit. Parse each item's
-`column_values` by `id` into a typed `Registration` object.
+Notes:
+- A player may register for **multiple games** at one event (one `Registration`
+  each) — the unique key allows it.
+- `Group`/`GroupMember` are produced by the matching step so players can view
+  their group in-app and so emails can be tracked (`emailedAt`).
 
 ---
 
 ## 5. Matching logic
 
 ```
-Registration = { id, name, email, game, eventDate, location, interested }
-
-1. Fetch all items for the board.
-2. Filter:
-     - interested === "Yes"
-     - eventDate === selectedDate
-     - (optional) location === selectedLocation
-3. Normalize the game string (trim, lowercase for the key, but keep a
-   display label). Optionally collapse obvious variants
-   (e.g. "Catan" / "Settlers of Catan") — start simple, refine later.
-4. Group by normalized game key.
-5. Output: Group = { game, players: Registration[] }, sorted by player count desc.
+For a given event:
+  1. Load registrations where eventId = event AND lookingForGroup = true.
+  2. Normalize game name -> key (trim; lowercase for the key; keep a display label).
+     Optionally collapse known aliases (e.g. "Catan" == "Settlers of Catan").
+  3. Group registrations by game key.
+  4. For each game with >= 1 interested player, create/replace a Group and its
+     GroupMembers. (Re-running replaces prior groups for that event.)
+  5. Set event.status = MATCHED.
 ```
 
-Keep group size **unlimited** — the goal is to connect everyone interested in a
-game, not cap groups. Show a count per group in the UI.
-
-Edge cases to handle: empty game field (skip or bucket as "Unspecified"),
-duplicate registrations (dedupe by email within a game), missing email (flag in
-UI, don't crash sending).
+Unlimited group size by design. Edge cases: empty game string (skip or bucket as
+"Unspecified"); a player registering the same game twice (prevented by unique key);
+re-running matching should be idempotent (clear old groups for the event first).
 
 ---
 
 ## 6. Screens / UI
 
-Single page is enough for v1:
+### Player-facing (Clerk-authenticated)
+- **Sign in / sign up** — Clerk components (email/password + Google).
+- **Home / Events** (`/`, `/events`) — list of upcoming game nights.
+- **Event detail** (`/events/[id]`) — event info + a **Register** action: choose
+  the game (free text, with suggestions of games others picked for this event) and
+  confirm "looking for a group". Shows the player's current registrations for the
+  event; allow edit/cancel before matching.
+- **My groups** (`/me`) — once an event is matched, show the player's group(s):
+  game, groupmates (names + emails so they can coordinate), event date/location.
 
-1. **Controls bar:** event date picker (defaults to today), optional location
-   filter, **Load Registrations** button.
-2. **Groups list:** one card per game, showing the game name, player count, and
-   the list of players (name + email). Each card has **Email this group**.
-3. **Global action:** **Send all emails** button + a summary (X groups, Y
-   players, Z with missing emails).
-4. **Feedback:** loading state while fetching, success/error toasts after
-   sending, and a per-group "Emailed ✓" indicator.
+### Admin (passcode-gated, `/admin`)
+- **Passcode prompt** → sets a cookie.
+- **Events list** — create / edit / close events.
+- **Event admin** (`/admin/events/[id]`) — see all registrations; **Run matching**
+  → preview groups (game + members + counts); **Send emails** per group or **Send
+  all**; shows `emailedAt` status per group.
 
-### Email content (per group)
-
-- **To:** each player in the group (or BCC the group, From a no-reply Operation
-  Tabletop address).
-- **Subject:** `Your Game Night group for {game} — {eventDate}`
-- **Body:** friendly note listing everyone in the group (names + emails) so they
-  can coordinate, plus event date/location. Keep a templated, editable body in a
-  `lib/emailTemplate.ts`.
+### Emails
+- **Subject:** `Your Game Night group for {game} — {date}`
+- **Body:** friendly note listing groupmates (names + emails) + event date/location
+  + a link to `/me`. Template lives in `lib/emailTemplate.ts`.
+- Decide To-vs-BCC per the privacy question in §11.
 
 ---
 
 ## 7. Step-by-step build directions
 
-1. **Scaffold:** `npx create-next-app@latest` (TypeScript, App Router, Tailwind).
-   Add shadcn/ui. Commit.
-2. **Env & config:** create `.env.local` with the variables in §8; add
-   `.env.example` (no secrets) to the repo; ensure `.env.local` is gitignored.
-3. **Monday.com client** (`lib/monday.ts`): a `fetchRegistrations()` that runs
-   the GraphQL query, paginates, and maps `column_values` → `Registration[]`.
-   Read `MONDAY_API_TOKEN` and `MONDAY_BOARD_ID` from env.
-4. **Verify board schema first:** write a tiny script/route that prints
-   `columns { id title type }` so you can confirm the board ID, location column,
-   and the IDs in §4 against the live board before wiring the rest.
-5. **Matching** (`lib/match.ts`): pure function implementing §5. Unit-test it
-   with sample data.
-6. **API routes:**
-   - `GET /api/registrations?date=&location=` → fetch + filter + group, return JSON.
-   - `POST /api/send-emails` (body: a group or "all") → send via Resend.
-7. **UI** (`app/page.tsx`): controls bar, groups list, email buttons, toasts —
-   per §6.
-8. **Email** (`lib/email.ts`): Resend client + `emailTemplate.ts`. Send to a test
-   inbox first.
-9. **Access gate** (`middleware.ts`): redirect to a passcode prompt unless a
-   cookie/header matches `APP_PASSCODE`. Keep it simple.
-10. **Polish:** error states, missing-email handling, "Emailed ✓" indicator,
-    empty-state messaging.
-11. **Deploy:** push to GitHub → import into Vercel → set env vars in Vercel →
-    verify the production URL → share with staff.
-12. *(Optional)* **Track sent state:** add a checkbox/status column in Monday.com
-    and have `/api/send-emails` write back so re-runs don't double-email.
+1. **Scaffold:** `npx create-next-app@latest` (TypeScript, App Router, Tailwind,
+   ESLint). Add shadcn/ui. Commit.
+2. **Database:** create a Neon (or Vercel) Postgres DB. Add `DATABASE_URL` to env.
+   `npm i prisma @prisma/client`; `npx prisma init`; add the §4 schema;
+   `npx prisma migrate dev`.
+3. **Player auth (Clerk):** create a Clerk app; add keys to env; wrap the app in
+   `<ClerkProvider>`; add sign-in/up routes; protect player pages in `middleware.ts`.
+   On first sign-in, upsert the `User` row (Clerk webhook or on-request upsert).
+4. **Admin gate:** in `middleware.ts`, additionally require a passcode cookie for
+   `/admin/*`; build a small passcode form that sets the cookie when `APP_PASSCODE`
+   matches.
+5. **Events:** admin pages + Server Actions to create/edit/close events; public
+   events list + detail pages.
+6. **Registration:** Server Action to create/edit/cancel a `Registration` for the
+   signed-in user on an event (game + lookingForGroup). Validate input.
+7. **Matching** (`lib/match.ts`): pure function per §5; a Server Action that clears
+   old groups for the event, writes new `Group`/`GroupMember` rows, sets status
+   MATCHED. Unit-test the pure function.
+8. **In-app group view:** `/me` reads the player's groups + groupmates.
+9. **Email** (`lib/email.ts` + `emailTemplate.ts`): Resend client; Server Action to
+   send per-group or all; set `emailedAt`. Test to a real inbox first.
+10. **Polish:** empty states, loading/toasts, missing-email handling, idempotent
+    re-match, "Emailed ✓" indicators.
+11. **Deploy:** push to GitHub → import to Vercel → set env vars (DB, Clerk, Resend,
+    passcode) → run prod migration → verify → share URL with players/staff.
+12. *(Optional)* Replace the admin passcode with Clerk roles; add scheduled
+    auto-match/auto-email before each event.
 
 ---
 
 ## 8. Environment variables / secrets
 
 ```
-MONDAY_API_TOKEN=        # Monday.com API v2 token, read access to the board
-MONDAY_BOARD_ID=         # numeric board ID of the registration board
-RESEND_API_KEY=          # Resend API key
+DATABASE_URL=                              # Postgres connection string (Neon/Vercel)
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=         # Clerk
+CLERK_SECRET_KEY=                          # Clerk
+RESEND_API_KEY=                            # Resend
 EMAIL_FROM=Operation Tabletop <gamenight@operationtabletop.org>  # verified sender
-APP_PASSCODE=            # shared staff passcode for the access gate
+APP_PASSCODE=                              # shared staff admin passcode
 ```
 
-Never commit real values. Set them in `.env.local` for dev and in the Vercel
-project settings for production. Commit a `.env.example` with the keys and empty
-values.
+Keep real values out of git. Use `.env.local` in dev and Vercel project settings in
+prod. Commit a `.env.example` with empty values.
 
 ---
 
-## 9. What I need from Erica to build this
+## 9. What I need from Erica to build & ship this
 
-- [ ] **Monday.com API token** — *Monday.com → Avatar → Developers → My Access
-      Tokens → copy.* (Or an admin can scope a token to read the board.)
-- [ ] **Board ID** of the registration board (the number in the board's URL).
-- [ ] **Resend account** + a **verified sending domain/address** (ideally on
-      `operationtabletop.org` for deliverability). I'll provide DNS records if
-      needed.
-- [ ] **Vercel account** with access to connect the `operationtabletop/gamematch`
-      GitHub repo.
-- [ ] Confirmation of the **location column** and whether v1 needs the location
-      filter or can ship date-only first.
+- [ ] **Postgres database** — create a free **Neon** project (or use Vercel
+      Postgres) and share the `DATABASE_URL`. (I can scaffold against a local DB
+      first and you plug this in at deploy.)
+- [ ] **Clerk account** — create an app at clerk.com; share the publishable +
+      secret keys; decide if Google sign-in should be enabled (recommended).
+- [ ] **Resend account** + **verified sending domain/address** (ideally on
+      `operationtabletop.org` for deliverability). I'll provide the DNS records.
+- [ ] **Vercel account** with access to connect `operationtabletop/gamematch`.
+- [ ] A **staff passcode** to set as `APP_PASSCODE`.
 
-I can build and commit the full app structure first (with the schema-verification
-step), then plug in your token/board ID to wire it to live data.
+I can build the entire app structure, data model, matching, and UI **before** any
+keys exist (using a local Postgres + Clerk dev keys), then you fill in production
+values at deploy time.
 
 ---
 
 ## 10. Future enhancements (post-v1)
 
-- Real auth (Auth.js + Google, restricted to `@operationtabletop.org`).
-- Smarter game matching (fuzzy matching of game-name variants/aliases).
-- Track emailed/contacted state back in Monday.com (no double-emails).
-- Per-event history & simple analytics (turnout by game).
-- Optional group-size targets / splitting large groups.
-- Scheduled auto-run + auto-email at a set time before each event.
-- Player replies / RSVP confirmation loop.
+- Per-user staff logins / roles (drop the shared passcode).
+- Smarter game matching (fuzzy alias matching, autocomplete from a games catalog).
+- Scheduled auto-match + auto-email a set time before each event.
+- RSVP / confirmation loop and reminders.
+- Player profiles, favorite games, attendance history, simple analytics.
+- Mobile-friendly PWA / native wrapper.
 
 ---
 
 ## 11. Open questions
 
-1. Should emails go **to all players directly** (everyone sees each other's
-   email to self-organize) or **individually/BCC** for privacy? (Recommend asking
-   Erica — affects the template and To/BCC handling.)
-2. Is there a **location column**, and is the location filter needed for v1?
-3. Any **branding** (logo, colors) to apply to the UI and email template?
-4. Should re-running for the same event **avoid re-emailing** people already
-   contacted? (Drives the optional Monday.com write-back.)
+1. **Email privacy:** should group emails show everyone's address (so players
+   self-organize) or be sent individually/BCC? (Affects To/BCC + template.)
+2. **Locations:** fixed list (Hurlburt Field, Eglin) or free-form per event?
+3. **Branding:** logo/colors for the UI and email template?
+4. **Google sign-in:** enable it in Clerk in addition to email/password?
+5. **Multiple games per player per event:** confirmed allowed — OK to keep?
